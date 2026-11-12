@@ -1,0 +1,80 @@
+--- aosp/libhardware/modules/audio/audio_hw.c	2026-11-12 16:34:08.637674396 +0000
++++ hal/audio_hw.c	2026-11-12 16:27:27.658954368 +0000
+@@ -18,7 +18,9 @@
+ //#define LOG_NDEBUG 0
+ 
+ #include <errno.h>
++#include <fcntl.h>
+ #include <malloc.h>
++#include <sys/stat.h>
+ #include <pthread.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+@@ -41,6 +43,29 @@
+ #define STUB_OUTPUT_BUFFER_MILLISECONDS  10
+ #define STUB_OUTPUT_DEFAULT_CHANNEL_MASK AUDIO_CHANNEL_OUT_STEREO
+ 
++/* redroid-mic: the mic reads raw s16le, 48 kHz, mono PCM from this FIFO.
++ * No writer or an empty FIFO gives silence, like the stock stub. */
++#define MIC_FIFO_PATH    "/mic/mic.fifo"
++#define MIC_SAMPLE_RATE  48000
++#define MIC_CHANNEL_MASK AUDIO_CHANNEL_IN_MONO
++
++static int mic_fd = -1;
++
++static void mic_open(void)
++{
++    if (mic_fd >= 0)
++        return;
++    if (mkfifo(MIC_FIFO_PATH, 0666) == 0)
++        chmod(MIC_FIFO_PATH, 0666); /* undo umask so any writer can feed it */
++    /* O_RDWR keeps the FIFO open for writers even while no stream reads,
++     * so a feeder never blocks on open() and reads never hit EOF. */
++    mic_fd = open(MIC_FIFO_PATH, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++    if (mic_fd < 0)
++        ALOGE("redroid-mic: open %s failed: %s", MIC_FIFO_PATH, strerror(errno));
++    else
++        ALOGI("redroid-mic: reading mic PCM from %s", MIC_FIFO_PATH);
++}
++
+ struct stub_audio_device {
+     struct audio_hw_device device;
+ };
+@@ -323,7 +348,12 @@
+     // On the subsequent in_read(), we measure the elapsed time spent in
+     // the recording thread. This is subtracted from the sleep estimate based on frames,
+     // thereby accounting for fill in the alsa buffer during the interim.
+-    memset(buffer, 0, bytes);
++    mic_open();
++    ssize_t got = mic_fd >= 0 ? read(mic_fd, buffer, bytes) : -1;
++    if (got < 0)
++        got = 0;
++    // shortcut: assumes writers send whole 2-byte frames (feed-wav.sh does); an odd write would shift samples.
++    memset((char *)buffer + got, 0, bytes - got);
+     return bytes;
+ }
+ 
+@@ -508,6 +538,15 @@
+     ALOGV("adev_open_input_stream...");
+ 
+     *stream_in = NULL;
++    // The FIFO carries one fixed format; propose it and let AudioFlinger resample.
++    if (config->sample_rate != MIC_SAMPLE_RATE ||
++            config->channel_mask != MIC_CHANNEL_MASK ||
++            config->format != AUDIO_FORMAT_PCM_16_BIT) {
++        config->sample_rate = MIC_SAMPLE_RATE;
++        config->channel_mask = MIC_CHANNEL_MASK;
++        config->format = AUDIO_FORMAT_PCM_16_BIT;
++        return -EINVAL;
++    }
+     struct stub_stream_in *in = (struct stub_stream_in *)calloc(1, sizeof(struct stub_stream_in));
+     if (!in)
+         return -ENOMEM;
+@@ -604,6 +643,7 @@
+     adev->device.dump = adev_dump;
+ 
+     *device = &adev->device.common;
++    mic_open();
+ 
+     return 0;
+ }

@@ -1,0 +1,5 @@
+aosp/
+mic/
+test/micrec/out/
+*.apk
+test/captured_*.wav
